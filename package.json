@@ -1,0 +1,11 @@
+{
+  "name": "ensemble",
+  "version": "0.1.0",
+  "description": "Ensemble — Cursor Agent and Gemini CLI plugins for Claude Code",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "lint:json": "node -e \"const fs=require('fs');const path=require('path');function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){if(e.name==='.git'||e.name==='node_modules')continue;const p=path.join(d,e.name);if(e.isDirectory())walk(p);else if(e.name.endsWith('.json'))JSON.parse(fs.readFileSync(p,'utf8'));}}walk('.');console.log('all json valid');\""
+  },
+  "license": "MIT"
+}

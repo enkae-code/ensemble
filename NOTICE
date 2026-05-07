@@ -1,0 +1,5 @@
+claude-code-extra-arms
+
+This project is licensed under the MIT License (see LICENSE).
+
+Architectural patterns in this repo are inspired by the OpenAI Codex Claude Code plugin (https://github.com/openai/codex), which is licensed under the Apache License 2.0. No code from that plugin is copied directly; this is a clean-room re-implementation. Credit and acknowledgment to the OpenAI Codex plugin authors.

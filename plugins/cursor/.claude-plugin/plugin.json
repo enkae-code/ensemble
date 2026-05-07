@@ -1,0 +1,8 @@
+{
+  "name": "cursor",
+  "version": "0.1.0",
+  "description": "Use Cursor Agent CLI from Claude Code to delegate tasks and run reviews.",
+  "author": {
+    "name": "Brodey (Enkae)"
+  }
+}
