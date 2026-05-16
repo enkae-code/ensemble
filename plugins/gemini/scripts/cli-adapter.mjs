@@ -5,9 +5,12 @@ import { createCliAdapter } from "../../../shared/lib/cli-adapter.mjs";
 export const GEMINI_BIN = process.env.GEMINI_BIN ?? "/home/brodey/.nvm/versions/node/v24.14.1/bin/gemini";
 export const GEMINI_AUTH_TIMEOUT_MS = 120_000;
 export const MODEL_PRESETS = Object.freeze({
-  pro: "gemini-2.5-pro",
-  flash: "gemini-2.5-flash",
-  "flash-lite": "gemini-2.5-flash-lite",
+  pro: "gemini-3.1-pro-preview",
+  flash: "gemini-3-flash-preview",
+  "flash-lite": "gemini-3.1-flash-lite-preview",
+  "pro-2.5": "gemini-2.5-pro",
+  "flash-2.5": "gemini-2.5-flash",
+  "flash-lite-2.5": "gemini-2.5-flash-lite",
 });
 export const RETRY_BACKOFFS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000, 32_000]);
 
@@ -24,7 +27,8 @@ export function stripTerminalNoise(text) {
 /** Resolve a supported Gemini model preset to a concrete model id. */
 export function resolveModelPreset(preset = "pro") {
   if (!Object.hasOwn(MODEL_PRESETS, preset)) {
-    throw new Error(`Unsupported model preset: ${preset}. Use 'pro', 'flash', or 'flash-lite'.`);
+    const known = Object.keys(MODEL_PRESETS).map((k) => `'${k}'`).join(", ");
+    throw new Error(`Unsupported model preset: ${preset}. Use one of: ${known}.`);
   }
   return MODEL_PRESETS[preset];
 }
