@@ -7,6 +7,7 @@ export const GEMINI_AUTH_TIMEOUT_MS = 120_000;
 export const MODEL_PRESETS = Object.freeze({
   pro: "gemini-2.5-pro",
   flash: "gemini-2.5-flash",
+  "flash-lite": "gemini-2.5-flash-lite",
 });
 export const RETRY_BACKOFFS_MS = Object.freeze([2_000, 4_000, 8_000, 16_000, 32_000]);
 
@@ -23,7 +24,7 @@ export function stripTerminalNoise(text) {
 /** Resolve a supported Gemini model preset to a concrete model id. */
 export function resolveModelPreset(preset = "pro") {
   if (!Object.hasOwn(MODEL_PRESETS, preset)) {
-    throw new Error(`Unsupported model preset: ${preset}. Use 'pro' or 'flash'.`);
+    throw new Error(`Unsupported model preset: ${preset}. Use 'pro', 'flash', or 'flash-lite'.`);
   }
   return MODEL_PRESETS[preset];
 }
