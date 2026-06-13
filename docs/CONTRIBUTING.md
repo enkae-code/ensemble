@@ -16,10 +16,9 @@ Node 20+ required. No external runtime dependencies — only Node built-ins.
 
 ## Project layout
 
-- `shared/lib/` — generic modules used by both arms (process, args, fs, git, state, render, job-control, tracked-jobs, workspace, cli-adapter, hooks, review-validation)
+- `shared/lib/` — generic modules used by the arm (process, args, fs, git, state, render, job-control, tracked-jobs, workspace, cli-adapter, hooks, review-validation)
 - `plugins/cursor/` — Cursor arm (CLI: `cursor-agent`)
-- `plugins/gemini/` — Gemini arm (CLI: `gemini`)
-- `tests/` — `node:test` suites covering both arms + shared
+- `tests/` — `node:test` suites covering the cursor arm + shared
 - `docs/` — architecture, per-arm guides, this file
 
 Each arm mirrors the same structure: `commands/`, `skills/`, `agents/`, `hooks/`, `prompts/`, `schemas/`, `scripts/`.
@@ -60,7 +59,7 @@ Tests should not require network access or the underlying CLIs to be installed; 
 Please include:
 - Node version (`node -v`)
 - OS + shell
-- Which arm (cursor / gemini)
+- Which arm (cursor)
 - Output of `/<arm>:setup`
 - Reproducer command + the resulting state dir contents (`~/.claude/plugins/data/<arm>-extra-arms/state/...`)
 

@@ -484,7 +484,7 @@ Supporting references:
 
 Porting insight:
 - The skill makes prompt quality a config asset rather than a JS concern.
-- Cursor and Gemini ports should keep the same idea even if prompt shape changes.
+- Future arm ports should keep the same idea even if prompt shape changes.
 
 ## 5. Agent definition
 
@@ -676,7 +676,7 @@ Write behavior:
 - `--write` flips Codex sandbox from `read-only` to `danger-full-access`.
 
 Why it matters:
-- The background worker pattern is the main long-running job pattern to port to Cursor and Gemini.
+- The background worker pattern is the main long-running job pattern to port to future arms.
 
 ### Tracking, status, result, and cancel
 
@@ -1884,7 +1884,7 @@ Steps:
 Why it matters:
 - Tests run against a real installed `codex` binary path, not only mocks.
 - Build step proves that app-server TS type generation and TS compile remain healthy.
-- A Cursor or Gemini port should keep the same split: install target CLI, run tests, run build.
+- A future arm port should keep the same split: install target CLI, run tests, run build.
 
 ## 16. License + NOTICE
 

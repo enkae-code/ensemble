@@ -1,8 +1,8 @@
 # ensemble
 
-Two extra execution arms for Claude Code: **Cursor Agent** and **Gemini CLI**.
+An extra execution arm for Claude Code: **Cursor Agent**.
 
-Mirrors the architecture of OpenAI's official Codex plugin so you can dispatch tasks, run reviews, and run adversarial reviews against either CLI from inside Claude Code — same patterns, same job lifecycle, same hooks.
+Mirrors the architecture of OpenAI's official Codex plugin so you can dispatch tasks, run reviews, and run adversarial reviews against Cursor from inside Claude Code — same patterns, same job lifecycle, same hooks.
 
 ## Status
 
@@ -10,7 +10,7 @@ Alpha. APIs and command names may shift.
 
 ## Why
 
-Anthropic's marketplace ships only one external execution arm (Codex). If Codex is on cooldown, billed out, or you want a different model family, you're stuck. This plugin pack gives you two more arms with full parity:
+Anthropic's marketplace ships only one external execution arm (Codex). If Codex is on cooldown, billed out, or you want a different model family, you're stuck. This plugin gives you one more arm with full parity:
 
 - background dispatch
 - persistent job state
@@ -26,7 +26,6 @@ Anthropic's marketplace ships only one external execution arm (Codex). If Codex 
 ```bash
 claude marketplace add brodey/ensemble
 claude plugin install cursor
-claude plugin install gemini
 ```
 
 (Final repo URL TBD; this is a placeholder for the alpha.)
@@ -49,22 +48,6 @@ Requires `CURSOR_API_KEY` exported (e.g. in `~/.bashrc`).
 
 Default model is `auto`. Premium presets (`premium`, `reasoning`, `fast`) trigger a quota warning before dispatch.
 
-### Gemini arm
-
-Requires `gemini auth login` (OAuth Google account).
-
-```bash
-/gemini:setup
-/gemini:rescue --background "explain this codebase"
-/gemini:status
-/gemini:result <job-id>
-/gemini:review
-/gemini:adversarial-review
-/gemini:cancel <job-id>
-```
-
-Default model is `gemini-2.5-pro`. Flash variant available via `--model flash`. The companion auto-retries 429 capacity errors with exponential backoff (2s → 32s, 5 attempts).
-
 ## Architecture
 
 See `docs/ARCHITECTURE.md` (~2k lines, mirrors the Codex plugin layout). High-level layout:
@@ -80,9 +63,7 @@ plugins/
 │   ├── prompts/adversarial-review.md
 │   ├── schemas/review-output.schema.json
 │   └── scripts/{cursor-companion.mjs, cli-adapter.mjs}
-└── gemini/                        # Gemini arm (mirror of Cursor)
-
-shared/lib/                        # Shared modules used by both arms
+shared/lib/                        # Shared modules used by the arm
                                    # process, args, fs, git, state, render,
                                    # job-control, tracked-jobs, workspace,
                                    # cli-adapter, hooks, review-validation
@@ -94,7 +75,7 @@ shared/lib/                        # Shared modules used by both arms
 export EXTRA_ARMS_REVIEW_GATE=1
 ```
 
-When set, the Stop hook runs `/cursor:review` (or `/gemini:review`) on every Claude turn end. Output must start with `ALLOW:` or the gate blocks the turn with `BLOCK:` reason. Off by default.
+When set, the Stop hook runs `/cursor:review` on every Claude turn end. Output must start with `ALLOW:` or the gate blocks the turn with `BLOCK:` reason. Off by default.
 
 ## Contributing
 

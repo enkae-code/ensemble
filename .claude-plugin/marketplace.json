@@ -4,7 +4,7 @@
     "name": "Brodey (Enkae)"
   },
   "metadata": {
-    "description": "Ensemble — Claude Code plugins that add Cursor Agent and Gemini CLI as first-class headless execution arms.",
+    "description": "Ensemble — Claude Code plugin that adds Cursor Agent as a first-class headless execution arm.",
     "version": "0.1.0"
   },
   "plugins": [
@@ -16,15 +16,6 @@
         "name": "Brodey (Enkae)"
       },
       "source": "./plugins/cursor"
-    },
-    {
-      "name": "gemini",
-      "description": "Use Gemini CLI from Claude Code to delegate tasks and run reviews.",
-      "version": "0.1.0",
-      "author": {
-        "name": "Brodey (Enkae)"
-      },
-      "source": "./plugins/gemini"
     }
   ]
 }

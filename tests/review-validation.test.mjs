@@ -4,13 +4,6 @@ import assert from "node:assert/strict";
 import { loadSchema, validateReviewOutput, extractJsonBlock } from "../shared/lib/review-validation.mjs";
 
 const cursorSchemaPath = path.resolve("plugins/cursor/schemas/review-output.schema.json");
-const geminiSchemaPath = path.resolve("plugins/gemini/schemas/review-output.schema.json");
-
-test("schema files load and have identical contracts across both arms", () => {
-  const a = loadSchema(cursorSchemaPath);
-  const b = loadSchema(geminiSchemaPath);
-  assert.deepEqual(a, b);
-});
 
 test("validateReviewOutput accepts a well-formed payload", () => {
   const schema = loadSchema(cursorSchemaPath);

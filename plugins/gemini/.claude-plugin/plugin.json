@@ -1,8 +1,0 @@
-{
-  "name": "gemini",
-  "version": "0.1.0",
-  "description": "Use Gemini CLI from Claude Code to delegate tasks and run reviews.",
-  "author": {
-    "name": "Brodey (Enkae)"
-  }
-}

@@ -4,7 +4,7 @@
 
 ## Why personas
 
-Right now each arm has one default identity ("a helpful Cursor/Gemini agent" plus whatever the user types). For specialized work — design review, security audit, refactor-only — users have to write the system prompt from scratch every time and remember which model preset is appropriate.
+Right now Cursor has one default identity ("a helpful Cursor agent" plus whatever the user types). For specialized work — design review, security audit, refactor-only — users have to write the system prompt from scratch every time and remember which model preset is appropriate.
 
 A persona bundles **identity + rules + skills + model preset + write-permission** into a named, reusable thing.
 
@@ -27,13 +27,13 @@ A team can also commit `.ensemble/personas/` to git so every contributor's dispa
 
 | Persona | Default model | allowed-write | Purpose |
 |---|---|---|---|
-| `architect` | reasoning (Cursor) / pro (Gemini) | false | System design, contracts, data flow. No code. |
-| `security-auditor` | reasoning / pro | false | OWASP, auth boundaries, data handling. |
-| `refactorer` | auto / pro | true | Minimal-diff structural improvements only. No new features. |
-| `test-writer` | auto / pro | true | Adds tests. Never modifies production code. |
-| `ui-polish` | premium (gemini-3.1-pro) / pro | true | Frontend-only. Design-system aware. |
-| `bug-hunter` | reasoning / pro | true | Root-cause first, fix second. Adds regression test. |
-| `doc-writer` | fast / flash | true | Documentation only. Never modifies code. |
+| `architect` | reasoning (Cursor) | false | System design, contracts, data flow. No code. |
+| `security-auditor` | reasoning | false | OWASP, auth boundaries, data handling. |
+| `refactorer` | auto | true | Minimal-diff structural improvements only. No new features. |
+| `test-writer` | auto | true | Adds tests. Never modifies production code. |
+| `ui-polish` | premium | true | Frontend-only. Design-system aware. |
+| `bug-hunter` | reasoning | true | Root-cause first, fix second. Adds regression test. |
+| `doc-writer` | fast | true | Documentation only. Never modifies code. |
 
 ## Persona file format
 
@@ -65,8 +65,8 @@ Output:
 ```bash
 /cursor:rescue --persona architect "Plan migration from sessions to JWT"
 /cursor:rescue --persona security-auditor "Review OAuth flow"
-/gemini:rescue --persona test-writer "Add coverage for src/auth.mjs"
-/gemini:rescue --persona doc-writer --model flash "Document the public API"
+/cursor:rescue --persona test-writer "Add coverage for src/auth.mjs"
+/cursor:rescue --persona doc-writer --model fast "Document the public API"
 ```
 
 Persona overrides flag-level model unless `--model` is also explicitly passed.

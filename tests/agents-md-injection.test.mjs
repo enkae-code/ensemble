@@ -3,7 +3,6 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { injectAgentsContext as injectCursor } from "../plugins/cursor/scripts/cursor-companion.mjs";
-import { injectAgentsContext as injectGemini } from "../plugins/gemini/scripts/gemini-companion.mjs";
 import { findAgentsFile } from "../shared/lib/workspace.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
@@ -32,21 +31,10 @@ test("cursor injectAgentsContext wraps content with the agents_md tag and preser
   temp.cleanup();
 });
 
-test("gemini injectAgentsContext wraps content the same way as cursor for cross-arm consistency", () => {
-  const { temp, nested } = setupRepoFixture("HARD RULE: never disable tests.");
-  const prompt = injectGemini(nested, "Refactor the auth module.");
-  assert.match(prompt, /<agents_md path=".*AGENTS\.md">/);
-  assert.match(prompt, /HARD RULE: never disable tests\./);
-  assert.ok(prompt.endsWith("Refactor the auth module."));
-  temp.cleanup();
-});
-
-test("no AGENTS.md in scope returns the prompt unchanged for both arms", () => {
+test("no AGENTS.md in scope returns the prompt unchanged", () => {
   const temp = makeTempDir("no-agents-");
   const cursorPrompt = injectCursor(temp.path, "Plain task.");
-  const geminiPrompt = injectGemini(temp.path, "Plain task.");
   assert.equal(cursorPrompt, "Plain task.");
-  assert.equal(geminiPrompt, "Plain task.");
   temp.cleanup();
 });
 
