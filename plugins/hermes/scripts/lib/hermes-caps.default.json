@@ -1,0 +1,10 @@
+{
+  "max_turns": 15,
+  "max_cost_usd": 2.5,
+  "idle_timeout_seconds": 900,
+  "max_wall_seconds": 1800,
+  "min_iteration_floor": 3,
+  "confidence_threshold": 80,
+  "saturation_threshold": 2,
+  "cost_brake_enabled": false
+}
