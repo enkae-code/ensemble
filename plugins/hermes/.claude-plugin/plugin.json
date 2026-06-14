@@ -1,0 +1,8 @@
+{
+  "name": "hermes",
+  "version": "0.1.0",
+  "description": "Use Hermes CLI from Claude Code to delegate tasks and run reviews.",
+  "author": {
+    "name": "Brodey (Enkae)"
+  }
+}
