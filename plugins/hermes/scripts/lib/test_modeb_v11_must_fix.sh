@@ -6,14 +6,51 @@ declare -r MODEB_PATH="${SCRIPT_DIR}/modeb.sh"
 declare -r TMP_ROOT="${TMPDIR:-/tmp}"
 
 test_dir=""
+tracked_pids=()
 case_failures=0
+
+track_pid() {
+  local pid="${1:-}"
+
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    tracked_pids+=("$pid")
+  fi
+}
+
+process_alive() {
+  local pid="$1"
+  local process_state
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ -n "$process_state" && "$process_state" != Z* ]]
+}
+
+kill_tracked_pids() {
+  local pid
+
+  for pid in "${tracked_pids[@]:-}"; do
+    if process_alive "$pid"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  sleep 0.2
+
+  for pid in "${tracked_pids[@]:-}"; do
+    if process_alive "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+}
 
 cleanup() {
   local saved_status="$?"
   set +e
 
+  kill_tracked_pids
   if [[ -n "$test_dir" ]]; then
-    pkill -f "$test_dir" 2>/dev/null || true
     rm -rf "$test_dir"
   fi
 
@@ -153,10 +190,9 @@ prepare_case_env() {
   local cost_brake_enabled="$6"
   local case_dir="$test_dir/$case_name"
 
-  mkdir -p "$case_dir/bin" "$case_dir/home/.hermes" "$case_dir/state"
+  mkdir -p "$case_dir/bin" "$case_dir/home/.hermes" "$case_dir/hooks" "$case_dir/state" "$case_dir/workdir"
   write_caps "$case_dir/state/hermes_caps.json" "$max_turns" "$max_cost_usd" "$idle_timeout_seconds" "$max_wall_seconds" "$cost_brake_enabled"
   initialize_state_db "$case_dir/state.db"
-  printf '{"agents":[]}\n' > "$case_dir/state/active_agents.json"
   cat > "$case_dir/home/.hermes/auth.json" <<'JSON'
 {
   "credential_pool": {
@@ -170,6 +206,14 @@ prepare_case_env() {
 }
 JSON
   write_hermes_stub "$case_dir/bin/hermes"
+  cat > "$case_dir/hooks/prelaunch" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+python3 -c 'import json, sys; json.load(sys.stdin)' >/dev/null
+printf '{"job_id":"modeb-v11-hook"}\n'
+EOF
+  chmod +x "$case_dir/hooks/prelaunch"
   printf '%s\n' "$case_dir"
 }
 
@@ -299,13 +343,20 @@ run_modeb() {
   local idle_timeout_seconds="$5"
   local max_wall_seconds="$6"
   local task="$7"
+  local hook_env=()
 
-  HOME="$case_dir/home" \
-  NEXUS_STATE_DIR="$case_dir/state" \
-  HERMES_CAPS_PATH="$case_dir/state/hermes_caps.json" \
-  HERMES_STATE_DB="$case_dir/state.db" \
-  HERMES_MODEB_KILL_GRACE_SECONDS=1 \
-  PATH="$case_dir/bin:$PATH" \
+  if [[ -x "$case_dir/hooks/prelaunch" ]]; then
+    hook_env+=(HERMES_HOOK_PRELAUNCH="$case_dir/hooks/prelaunch")
+  fi
+
+  env \
+    HOME="$case_dir/home" \
+    HERMES_CAPS_PATH="$case_dir/state/hermes_caps.json" \
+    HERMES_STATE_DB="$case_dir/state.db" \
+    HERMES_WORKDIR="$case_dir/workdir" \
+    HERMES_MODEB_KILL_GRACE_SECONDS=1 \
+    PATH="$case_dir/bin:$PATH" \
+    "${hook_env[@]}" \
     bash "$MODEB_PATH" \
       --model opencode-go/glm-5.1 \
       --account default \
@@ -407,17 +458,18 @@ case_f1_process_group_kill() {
 
   setsid bash -c 'trap "" TERM; (trap "" TERM; while true; do sleep 1; done) & echo "$!" > "$1"; while true; do sleep 1; done' modeb-pgid "$case_dir/grandchild.pid" &
   target_pid="$!"
+  track_pid "$target_pid"
 
   for _ in {1..20}; do
     [[ -s "$case_dir/grandchild.pid" ]] && break
     sleep 0.1
   done
   grandchild_pid="$(< "$case_dir/grandchild.pid")"
+  track_pid "$grandchild_pid"
 
   HOME="$case_dir/home" \
-  NEXUS_STATE_DIR="$case_dir/state" \
   HERMES_STATE_DB="$db_path" \
-  REGISTRY_PATH="/bin/true" \
+  HERMES_HOOK_JOB_TOUCH="/bin/true" \
   bash -c '
     source "$1"
     reason_path="$2"
@@ -546,11 +598,11 @@ case_f4_unwritable_reason_kills_child() {
 
   setsid bash -c 'trap "" TERM; while true; do sleep 1; done' &
   target_pid="$!"
+  track_pid "$target_pid"
 
   HOME="$case_dir/home" \
-  NEXUS_STATE_DIR="$case_dir/state" \
   HERMES_STATE_DB="$db_path" \
-  REGISTRY_PATH="/bin/true" \
+  HERMES_HOOK_JOB_TOUCH="/bin/true" \
   bash -c '
     source "$1"
     reason_path="$2/reason"
@@ -588,6 +640,7 @@ case_f5_cost_brake_toggle() {
   refuse_dir="$(prepare_case_env f5-refuse 10 1 30 30 true)"
   refuse_output="$refuse_dir/output.txt"
   refuse_report="$refuse_dir/report.md"
+  rm -f "$refuse_dir/hooks/prelaunch"
   set +e
   run_modeb "$refuse_dir" "$refuse_output" 10 5 30 30 "$(task_with_report "$refuse_report" MODEB_STUB_SHORT_OK)"
   refuse_exit="$?"

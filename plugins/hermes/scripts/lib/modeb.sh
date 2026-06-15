@@ -3,10 +3,9 @@ set -euo pipefail
 
 declare -r SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 declare -r CAPS_PATH="${HERMES_CAPS_PATH:-${SCRIPT_DIR}/hermes-caps.default.json}"
-declare -r PREFLIGHT_PATH="/home/brodey/nexus/scripts/hermes_preflight.py"
-declare -r REGISTRY_PATH="${REGISTRY_PATH:-/home/brodey/nexus/scripts/hermes_agent_registry.py}"
-declare -r HERMES_STATE_DB="${HERMES_STATE_DB:-/home/brodey/.hermes/state.db}"
-declare -r VAULT_ROOT="${VAULT_ROOT:-/home/brodey/vault}"
+declare -r HERMES_BIN="${HERMES_BIN:-hermes}"
+declare -r HERMES_STATE_DB="${HERMES_STATE_DB:-$HOME/.hermes/state.db}"
+declare -r HERMES_WORKDIR="${HERMES_WORKDIR:-${VAULT_ROOT:-$PWD}}"
 declare -r DEFAULT_PROVIDER="opencode-go"
 declare -r DEFAULT_MODEL="glm-5.1"
 declare -r MODEB_LAUNCH_MARKER_PREFIX="[modeb-launch-id:"
@@ -21,6 +20,7 @@ log_path=""
 preflight_stdout_path=""
 preflight_stderr_path=""
 preflight_caps_path=""
+prelaunch_payload_path=""
 session_child_pid_path=""
 reason_path=""
 reason_lock_path=""
@@ -30,18 +30,26 @@ monitor_pid=""
 job_id=""
 child_waited=0
 modeb_metadata_path="${MODEB_METADATA_PATH:-}"
+modeb_final_status="unknown"
 
 durable_log_path() {
   local id="${job_id:-modeb-$(date +%Y%m%d-%H%M%S)}"
   printf '%s/.hermes/results/%s-hermes.log' "$HOME" "$id"
 }
 
-preflight_available() {
-  [[ -f "$PREFLIGHT_PATH" ]]
+prelaunch_hook_available() {
+  [[ -n "${HERMES_HOOK_PRELAUNCH:-}" && -x "$HERMES_HOOK_PRELAUNCH" ]]
 }
 
-registry_available() {
-  [[ -n "${REGISTRY_PATH:-}" && -f "$REGISTRY_PATH" ]]
+prelaunch_hook_misconfigured() {
+  [[ -n "${HERMES_HOOK_PRELAUNCH:-}" && ! -x "$HERMES_HOOK_PRELAUNCH" ]]
+}
+
+hook_available() {
+  local hook_var="$1"
+  local hook_path="${!hook_var:-}"
+
+  [[ -n "$hook_path" && -x "$hook_path" ]]
 }
 
 usage() {
@@ -306,31 +314,117 @@ write_preflight_refusal_artifacts() {
   printf 'preflight-report: %s\n' "$durable_path" >&2
 }
 
-resolve_obsidian_key() {
-  local env_path
-  local key_assignment
+write_prelaunch_payload() {
+  local destination_path="$1"
+  local caps_path="$2"
+  local account="$3"
+  local provider="$4"
+  local model="$5"
+  local pid="$6"
+  local max_turns="$7"
+  local max_cost_usd="$8"
+  local idle_timeout_seconds="$9"
+  local max_wall_seconds="${10}"
+  local task_payload="${11}"
 
-  if [[ -n "${OBSIDIAN_API_KEY:-}" ]]; then
-    export OBSIDIAN_API_KEY
+  python3 -c '
+import json
+import sys
+
+destination_path, caps_path = sys.argv[1:3]
+with open(caps_path, "r", encoding="utf-8") as handle:
+    caps = json.load(handle)
+
+payload = {
+    "account": sys.argv[3],
+    "provider": sys.argv[4],
+    "model": sys.argv[5],
+    "pid": int(sys.argv[6]),
+    "max_turns": int(sys.argv[7]),
+    "max_cost_usd": float(sys.argv[8]),
+    "idle_timeout_seconds": int(sys.argv[9]),
+    "max_wall_seconds": int(sys.argv[10]),
+    "caps": caps,
+    "task": sys.argv[11],
+}
+with open(destination_path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+' "$destination_path" "$caps_path" "$account" "$provider" "$model" "$pid" "$max_turns" "$max_cost_usd" "$idle_timeout_seconds" "$max_wall_seconds" "$task_payload"
+  chmod 600 "$destination_path"
+}
+
+extract_prelaunch_job_id() {
+  local stdout_path="$1"
+
+  python3 -c '
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        raw = handle.read().strip()
+    if not raw:
+        print("")
+        sys.exit(0)
+    payload = json.loads(raw)
+except (OSError, json.JSONDecodeError):
+    print("")
+    sys.exit(0)
+
+job_id = payload.get("job_id") if isinstance(payload, dict) else ""
+print(job_id if isinstance(job_id, str) else "")
+' "$stdout_path"
+}
+
+generate_job_id() {
+  python3 -c 'import uuid; print(f"modeb-{uuid.uuid4().hex}")'
+}
+
+write_job_hook_payload() {
+  local job_hook_id="$1"
+  local pid="$2"
+  local session="$3"
+  local status="$4"
+
+  python3 -c '
+import json
+import sys
+
+payload = {
+    "job_id": sys.argv[1],
+    "pid": int(sys.argv[2]) if sys.argv[2].isdigit() else None,
+    "session": sys.argv[3],
+    "status": sys.argv[4],
+}
+json.dump(payload, sys.stdout, sort_keys=True)
+sys.stdout.write("\n")
+' "$job_hook_id" "$pid" "$session" "$status"
+}
+
+run_job_touch_hook() {
+  local job_hook_id="$1"
+  local pid="$2"
+  local session="$3"
+  local status="$4"
+
+  if [[ -z "$job_hook_id" ]] || ! hook_available HERMES_HOOK_JOB_TOUCH; then
+    return 1
+  fi
+
+  write_job_hook_payload "$job_hook_id" "$pid" "$session" "$status" | "$HERMES_HOOK_JOB_TOUCH" >/dev/null 2>&1 || true
+  return 0
+}
+
+run_job_release_hook() {
+  local job_hook_id="$1"
+  local status="$2"
+
+  if [[ -z "$job_hook_id" ]] || ! hook_available HERMES_HOOK_JOB_RELEASE; then
     return 0
   fi
 
-  for env_path in /home/brodey/vault/.env /home/brodey/secure/credentials/nexus.env; do
-    if [[ ! -f "$env_path" ]]; then
-      continue
-    fi
-
-    key_assignment="$(grep '^OBSIDIAN_API_KEY=' "$env_path" 2>/dev/null | tail -n1 | xargs || true)"
-    if [[ -z "$key_assignment" ]]; then
-      continue
-    fi
-
-    export "$key_assignment"
-    if [[ -n "${OBSIDIAN_API_KEY:-}" ]]; then
-      return 0
-    fi
-  done
-
+  write_job_hook_payload "$job_hook_id" "" "" "$status" | "$HERMES_HOOK_JOB_RELEASE" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -450,9 +544,10 @@ record_final_activity() {
   local launch_epoch="$2"
   local preexisting_ids_path="$3"
   local launch_marker="$4"
+  local session_label="${5:-}"
   local row_id
 
-  if [[ -z "$registry_job_id" ]] || ! registry_available; then
+  if [[ -z "$registry_job_id" ]] || ! hook_available HERMES_HOOK_JOB_TOUCH; then
     return 1
   fi
 
@@ -461,7 +556,7 @@ record_final_activity() {
     return 1
   fi
 
-  python3 "$REGISTRY_PATH" touch --job-id "$registry_job_id" >/dev/null 2>&1 || return 1
+  run_job_touch_hook "$registry_job_id" "$$" "$session_label" "finalizing" || true
   return 0
 }
 
@@ -657,8 +752,8 @@ cleanup() {
     wait "$launcher_pid" 2>/dev/null
   fi
 
-  if [[ -n "$job_id" ]] && registry_available; then
-    python3 "$REGISTRY_PATH" release --job-id "$job_id" >/dev/null 2>&1 || true
+  if [[ -n "$job_id" ]]; then
+    run_job_release_hook "$job_id" "$modeb_final_status"
   fi
 
   if [[ -n "$work_dir" ]]; then
@@ -676,6 +771,7 @@ handle_signal() {
   local signal_status="$1"
 
   set_stop_reason "cancelled" || true
+  modeb_final_status="cancelled"
   cleanup "$signal_status"
 }
 
@@ -691,6 +787,7 @@ activity_monitor_loop() {
   local launch_epoch="$6"
   local preexisting_ids_path="$7"
   local launch_marker="$8"
+  local session_label="${9:-}"
   local start_epoch
   local last_activity_epoch
   local previous_activity_key=""
@@ -761,9 +858,7 @@ activity_monitor_loop() {
     fi
 
     if [[ "$activity_key" != "$previous_activity_key" ]]; then
-      if [[ -n "$registry_job_id" ]] && registry_available; then
-        python3 "$REGISTRY_PATH" touch --job-id "$registry_job_id" >/dev/null 2>&1 || true
-      fi
+      run_job_touch_hook "$registry_job_id" "$target_pid" "$session_label" "running" || true
       previous_activity_key="$activity_key"
       last_activity_epoch="$current_epoch"
       continue
@@ -993,6 +1088,7 @@ main() {
   preflight_stdout_path="$work_dir/preflight.stdout.json"
   preflight_stderr_path="$work_dir/preflight.stderr"
   preflight_caps_path="$work_dir/preflight_caps.json"
+  prelaunch_payload_path="$work_dir/prelaunch.json"
   session_child_pid_path="$work_dir/session-child.pid"
   reason_path="$work_dir/stop.reason"
   reason_lock_path="$work_dir/stop.reason.lock"
@@ -1020,31 +1116,39 @@ main() {
     "$min_iteration_floor" \
     "$confidence_threshold" \
     "$saturation_threshold")"
-  if [[ "$cost_brake_enabled" == "true" ]]; then
-    resolve_obsidian_key
-  fi
   write_preflight_caps "$preflight_caps_path" "$cost_brake_enabled"
 
-  if preflight_available; then
-    if python3 "$PREFLIGHT_PATH" \
-      --account "$account" \
-      --provider "$provider" \
-      --pid "$$" \
-      --max-turns "$max_turns" \
-      --max-cost-usd "$max_cost_usd" \
-      --caps "$preflight_caps_path" \
+  if prelaunch_hook_misconfigured; then
+    preflight_exit=2
+    preflight_refusal_note="Prelaunch hook is configured but not executable: $HERMES_HOOK_PRELAUNCH"
+    printf 'prelaunch hook misconfigured; refusing launch: %s\n' "$HERMES_HOOK_PRELAUNCH" >&2
+  elif prelaunch_hook_available; then
+    write_prelaunch_payload \
+      "$prelaunch_payload_path" \
+      "$preflight_caps_path" \
+      "$account" \
+      "$provider" \
+      "$model" \
+      "$$" \
+      "$max_turns" \
+      "$max_cost_usd" \
+      "$idle_timeout_seconds" \
+      "$max_wall_seconds" \
+      "$task_payload"
+    if "$HERMES_HOOK_PRELAUNCH" \
+      < "$prelaunch_payload_path" \
       > "$preflight_stdout_path" \
       2> "$preflight_stderr_path"; then
       preflight_exit=0
     else
-      preflight_exit="$?"
+      preflight_exit=2
     fi
   else
     preflight_exit=0
     if [[ "$cost_brake_enabled" == "true" ]]; then
       preflight_exit=2
-      preflight_refusal_note="Cost brake was requested, but preflight is unavailable, so launch was refused before Hermes started."
-      echo "preflight unavailable; refusing cost-braked launch" >&2
+      preflight_refusal_note="Cost brake was requested, but no prelaunch hook is configured, so launch was refused before Hermes started."
+      echo "prelaunch hook unavailable; refusing cost-braked launch" >&2
     fi
   fi
 
@@ -1070,12 +1174,11 @@ main() {
     return "$preflight_exit"
   fi
 
-  if preflight_available; then
-    if ! job_id="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["job_id"])' "$preflight_stdout_path")"; then
-      echo "preflight returned JSON without job_id" >&2
-      return 1
-    fi
+  job_id="$(extract_prelaunch_job_id "$preflight_stdout_path")"
+  if [[ -z "$job_id" ]]; then
+    job_id="$(generate_job_id)"
   fi
+  run_job_touch_hook "$job_id" "$$" "$session_name" "running" || true
 
   setsid --wait bash -c '
     trap - EXIT INT TERM
@@ -1084,7 +1187,7 @@ main() {
       exit 124
     fi
     cd "$2" || exit 1
-    exec timeout -k "$3" "$4" env HERMES_MAX_ITERATIONS="$5" hermes \
+    exec timeout -k "$3" "$4" env HERMES_MAX_ITERATIONS="$5" "${12}" \
       -z "$6" \
       --continue "$7" \
       --yolo \
@@ -1092,7 +1195,7 @@ main() {
       -m "$9"
   ' modeb-child \
     "$fifo_path" \
-    "$VAULT_ROOT" \
+    "$HERMES_WORKDIR" \
     "$MODEB_KILL_GRACE_SECONDS" \
     "$hard_wall_seconds" \
     "$max_turns" \
@@ -1102,6 +1205,7 @@ main() {
     "$model" \
     "$fifo_handshake_timeout_seconds" \
     "$session_child_pid_path" \
+    "$HERMES_BIN" \
     > "$log_path" 2>&1 &
   launcher_pid="$!"
   child_pid="$(read_session_child_pid "$session_child_pid_path" "$launcher_pid")"
@@ -1111,7 +1215,7 @@ main() {
   sqlite3 "$HERMES_STATE_DB" "SELECT id FROM sessions;" > "$preexisting_ids_path" 2>/dev/null || : > "$preexisting_ids_path"
   printf 'start\n' > "$fifo_path"
 
-  ( trap - EXIT INT TERM; activity_monitor_loop "$child_pid" "$job_id" "$idle_timeout_seconds" "$max_wall_seconds" "$max_turns" "$launch_epoch" "$preexisting_ids_path" "$launch_marker" ) &
+  ( trap - EXIT INT TERM; activity_monitor_loop "$child_pid" "$job_id" "$idle_timeout_seconds" "$max_wall_seconds" "$max_turns" "$launch_epoch" "$preexisting_ids_path" "$launch_marker" "$session_name" ) &
   monitor_pid="$!"
 
   set +e
@@ -1125,13 +1229,14 @@ main() {
     monitor_pid=""
   fi
 
-  if record_final_activity "$job_id" "$launch_epoch" "$preexisting_ids_path" "$launch_marker"; then
+  if record_final_activity "$job_id" "$launch_epoch" "$preexisting_ids_path" "$launch_marker" "$session_name"; then
     sleep 3
   fi
 
   local resolved_row_id=""
   local final_turn_count="0"
   final_status="$(classify_status "$child_exit")"
+  modeb_final_status="$final_status"
   resolved_row_id="$(resolve_row_id "$launch_epoch" "$preexisting_ids_path" "$launch_marker")"
   if [[ -n "$resolved_row_id" ]]; then
     final_turn_count="$(query_row_metrics "$resolved_row_id" | awk '{print $1}')"

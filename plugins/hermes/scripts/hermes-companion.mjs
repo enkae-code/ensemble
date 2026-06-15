@@ -259,8 +259,75 @@ function parsePositiveNumberOption(flag, value) {
   return parsed;
 }
 
+export function resolveConfiguredPath(configuredPath, homeDir = os.homedir()) {
+  const rawPath = String(configuredPath ?? "");
+  if (rawPath === "~") {
+    return homeDir;
+  }
+  if (rawPath.startsWith("~/")) {
+    return path.resolve(path.join(homeDir, rawPath.slice(2)));
+  }
+  if (rawPath === "$HOME") {
+    return homeDir;
+  }
+  if (rawPath.startsWith("$HOME/")) {
+    return path.resolve(path.join(homeDir, rawPath.slice(6)));
+  }
+  return path.resolve(rawPath);
+}
+
+function loadHermesPluginConfig(env = process.env) {
+  if (!env.HERMES_PLUGIN_CONFIG) {
+    return {};
+  }
+
+  const configPath = resolveConfiguredPath(env.HERMES_PLUGIN_CONFIG);
+  const raw = safeReadFile(configPath);
+  if (!raw) {
+    throw new Error(`Missing Hermes plugin config: ${configPath}`);
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Invalid Hermes plugin config: ${configPath} (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+function useConfigValue(env, name, value) {
+  if (env[name] != null && env[name] !== "") {
+    return env[name];
+  }
+  return value == null || value === "" ? undefined : String(value);
+}
+
+function buildModebSpawnEnv(baseEnv, cwd) {
+  const config = loadHermesPluginConfig(baseEnv);
+  const nextEnv = { ...baseEnv };
+  const hooks = config && typeof config.hooks === "object" && config.hooks !== null ? config.hooks : {};
+  const values = {
+    HERMES_BIN: config.bin,
+    HERMES_CAPS_PATH: config.caps_path,
+    HERMES_WORKDIR: config.workdir ?? cwd,
+    HERMES_HOOK_PRELAUNCH: hooks.prelaunch,
+    HERMES_HOOK_JOB_TOUCH: hooks.job_touch,
+    HERMES_HOOK_JOB_RELEASE: hooks.job_release,
+  };
+
+  for (const [name, value] of Object.entries(values)) {
+    const resolvedValue = useConfigValue(baseEnv, name, value);
+    if (resolvedValue !== undefined) {
+      nextEnv[name] = resolvedValue;
+    }
+  }
+
+  return nextEnv;
+}
+
 function resolveResearchCapsTemplatePath() {
-  return process.env.HERMES_CAPS_PATH ? path.resolve(process.env.HERMES_CAPS_PATH) : DEFAULT_RESEARCH_CAPS_PATH;
+  const config = loadHermesPluginConfig();
+  const configuredPath = process.env.HERMES_CAPS_PATH || config.caps_path;
+  return configuredPath ? resolveConfiguredPath(configuredPath) : DEFAULT_RESEARCH_CAPS_PATH;
 }
 
 function loadResearchCapsTemplate() {
@@ -759,9 +826,8 @@ async function runModebResearch(job, updateProgress) {
       taskPayload,
     ];
     const env = {
-      ...process.env,
+      ...buildModebSpawnEnv(process.env, cwd),
       HERMES_CAPS_PATH: capsPath,
-      VAULT_ROOT: cwd,
       MODEB_METADATA_PATH: metadataPath,
     };
 

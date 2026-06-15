@@ -3,28 +3,90 @@ set -euo pipefail
 
 declare -r SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 declare -r MODEB_PATH="${SCRIPT_DIR}/modeb.sh"
-declare -r REGISTRY_PATH="/home/brodey/nexus/scripts/hermes_agent_registry.py"
-declare -r ACTIVE_AGENTS_PATH="/home/brodey/.nexus/state/active_agents.json"
+declare -r COMPANION_PATH="${SCRIPT_DIR}/../hermes-companion.mjs"
 declare -r TMP_ROOT="${TMPDIR:-/tmp}"
 
 test_dir=""
-active_wrapper_pids=()
+tracked_pids=()
 case_failures=0
-case_skipped=0
 before_temp_list=""
-started_wrapper_pid=""
+
+track_pid() {
+  local pid="${1:-}"
+
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    tracked_pids+=("$pid")
+  fi
+}
+
+process_alive() {
+  local pid="$1"
+  local process_state
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ -n "$process_state" && "$process_state" != Z* ]]
+}
+
+process_group_alive() {
+  local pgid="$1"
+
+  [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || return 1
+  ps -o stat= -g "$pgid" 2>/dev/null | awk 'NF && $1 !~ /^Z/ { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+wait_for_pid_dead() {
+  local pid="$1"
+  local timeout_seconds="$2"
+  local start_epoch
+
+  start_epoch="$(date +%s)"
+  while process_alive "$pid"; do
+    if (( $(date +%s) - start_epoch >= timeout_seconds )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+wait_for_process_group_dead() {
+  local pgid="$1"
+  local timeout_seconds="$2"
+  local start_epoch
+
+  start_epoch="$(date +%s)"
+  while process_group_alive "$pgid"; do
+    if (( $(date +%s) - start_epoch >= timeout_seconds )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+kill_tracked_pids() {
+  local pid
+
+  for pid in "${tracked_pids[@]:-}"; do
+    if process_alive "$pid"; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+
+  sleep 0.2
+
+  for pid in "${tracked_pids[@]:-}"; do
+    if process_alive "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
+}
 
 cleanup() {
   local saved_status="$?"
   set +e
 
-  for wrapper_pid in "${active_wrapper_pids[@]:-}"; do
-    if [[ -n "$wrapper_pid" ]] && kill -0 "$wrapper_pid" 2>/dev/null; then
-      kill "$wrapper_pid" 2>/dev/null
-      wait "$wrapper_pid" 2>/dev/null
-    fi
-  done
-
+  kill_tracked_pids
   if [[ -n "$test_dir" ]]; then
     rm -rf "$test_dir"
   fi
@@ -45,11 +107,7 @@ run_case() {
   local case_name="$1"
   shift
 
-  case_skipped=0
   if "$@"; then
-    if [[ "$case_skipped" -eq 1 ]]; then
-      return 0
-    fi
     print_case_result "$case_name" "PASS"
     return 0
   fi
@@ -59,194 +117,35 @@ run_case() {
   return 0
 }
 
-modeb_args() {
-  if [[ -n "${HERMES_MODEB_MODEL:-}" ]]; then
-    printf '%s\n' "--model"
-    printf '%s\n' "$HERMES_MODEB_MODEL"
-  fi
-}
-
-run_longrun_background() {
-  local account="$1"
-  local session_name="$2"
-  local output_path="$3"
-  local task="$4"
-  shift 4
-  local model_args=()
-
-  mapfile -t model_args < <(modeb_args)
-
-  bash "$MODEB_PATH" \
-    "${model_args[@]}" \
-    --account "$account" \
-    --session "$session_name" \
-    "$@" \
-    "$task" \
-    > "$output_path" 2>&1 &
-
-  started_wrapper_pid="$!"
-  active_wrapper_pids+=("$started_wrapper_pid")
-}
-
-read_account_entries() {
-  local account="$1"
+write_caps() {
+  local caps_path="$1"
+  local max_turns="$2"
+  local max_cost_usd="$3"
+  local idle_timeout_seconds="$4"
+  local max_wall_seconds="$5"
+  local cost_brake_enabled="$6"
 
   python3 -c '
 import json
 import sys
 
-state_path = sys.argv[1]
-account = sys.argv[2]
-
-try:
-    with open(state_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-except FileNotFoundError:
-    payload = {}
-
-if isinstance(payload, dict):
-    if all(isinstance(entry, dict) for entry in payload.values()):
-        entries = list(payload.values())
-    else:
-        entries = payload.get("agents", payload.get("active_agents", []))
-elif isinstance(payload, list):
-    entries = payload
-else:
-    entries = []
-
-matched_entries = [
-    entry for entry in entries
-    if isinstance(entry, dict) and entry.get("account") == account
-]
-print(json.dumps(matched_entries))
-' "$ACTIVE_AGENTS_PATH" "$account"
+payload = {
+    "max_turns": int(sys.argv[2]),
+    "max_cost_usd": float(sys.argv[3]),
+    "idle_timeout_seconds": int(sys.argv[4]),
+    "max_wall_seconds": int(sys.argv[5]),
+    "min_iteration_floor": 1,
+    "confidence_threshold": 80,
+    "saturation_threshold": 2,
+    "cost_brake_enabled": sys.argv[6] == "true",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+' "$caps_path" "$max_turns" "$max_cost_usd" "$idle_timeout_seconds" "$max_wall_seconds" "$cost_brake_enabled"
 }
 
-entry_count_for_account() {
-  local account="$1"
-
-  read_account_entries "$account" | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))'
-}
-
-first_last_activity_for_account() {
-  local account="$1"
-
-  read_account_entries "$account" | python3 -c '
-import json
-import sys
-
-entries = json.load(sys.stdin)
-print(entries[0].get("last_activity", "") if entries else "")
-'
-}
-
-wait_for_account_entry() {
-  local account="$1"
-  local timeout_seconds="$2"
-  local start_epoch
-  local current_epoch
-
-  start_epoch="$(date +%s)"
-  while true; do
-    if [[ "$(entry_count_for_account "$account")" -gt 0 ]]; then
-      return 0
-    fi
-
-    current_epoch="$(date +%s)"
-    if (( current_epoch - start_epoch >= timeout_seconds )); then
-      return 1
-    fi
-
-    sleep 1
-  done
-}
-
-wait_for_no_account_entry() {
-  local account="$1"
-  local timeout_seconds="$2"
-  local start_epoch
-  local current_epoch
-
-  start_epoch="$(date +%s)"
-  while true; do
-    if [[ "$(entry_count_for_account "$account")" -eq 0 ]]; then
-      return 0
-    fi
-
-    current_epoch="$(date +%s)"
-    if (( current_epoch - start_epoch >= timeout_seconds )); then
-      return 1
-    fi
-
-    sleep 1
-  done
-}
-
-wait_for_last_activity_advance() {
-  local account="$1"
-  local original_activity="$2"
-  local timeout_seconds="$3"
-  local start_epoch
-  local current_epoch
-  local current_activity
-
-  start_epoch="$(date +%s)"
-  while true; do
-    current_activity="$(first_last_activity_for_account "$account")"
-    if [[ -n "$current_activity" && "$current_activity" != "$original_activity" ]]; then
-      return 0
-    fi
-
-    current_epoch="$(date +%s)"
-    if (( current_epoch - start_epoch >= timeout_seconds )); then
-      return 1
-    fi
-
-    sleep 2
-  done
-}
-
-remove_active_wrapper_pid() {
-  local finished_pid="$1"
-  local remaining_pids=()
-  local wrapper_pid
-
-  for wrapper_pid in "${active_wrapper_pids[@]:-}"; do
-    if [[ "$wrapper_pid" != "$finished_pid" ]]; then
-      remaining_pids+=("$wrapper_pid")
-    fi
-  done
-
-  active_wrapper_pids=("${remaining_pids[@]:-}")
-}
-
-write_modeb_registry_stub() {
-  local stub_path="$1"
-
-  cat > "$stub_path" <<'EOF'
-#!/usr/bin/env python3
-import json
-import os
-import sys
-
-command = sys.argv[1]
-touch_log_path = os.environ["MODEB_TEST_TOUCH_LOG"]
-
-if command == "touch":
-    with open(touch_log_path, "a", encoding="utf-8") as handle:
-        handle.write(sys.argv[3] + "\n")
-    sys.exit(0)
-
-if command == "release":
-    sys.exit(0)
-
-raise SystemExit(1)
-EOF
-
-  chmod +x "$stub_path"
-}
-
-initialize_modeb_state_db() {
+initialize_state_db() {
   local db_path="$1"
 
   python3 -c '
@@ -259,53 +158,18 @@ connection.executescript(
     CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
         source TEXT NOT NULL,
-        user_id TEXT,
-        model TEXT,
-        model_config TEXT,
-        system_prompt TEXT,
-        parent_session_id TEXT,
         started_at REAL NOT NULL,
-        ended_at REAL,
-        end_reason TEXT,
-        message_count INTEGER DEFAULT 0,
-        tool_call_count INTEGER DEFAULT 0,
-        input_tokens INTEGER DEFAULT 0,
-        output_tokens INTEGER DEFAULT 0,
-        cache_read_tokens INTEGER DEFAULT 0,
-        cache_write_tokens INTEGER DEFAULT 0,
-        reasoning_tokens INTEGER DEFAULT 0,
-        billing_provider TEXT,
-        billing_base_url TEXT,
-        billing_mode TEXT,
         estimated_cost_usd REAL,
         actual_cost_usd REAL,
-        cost_status TEXT,
-        cost_source TEXT,
-        pricing_version TEXT,
-        title TEXT,
-        api_call_count INTEGER DEFAULT 0,
-        handoff_state TEXT,
-        handoff_platform TEXT,
-        handoff_error TEXT
+        output_tokens INTEGER DEFAULT 0,
+        api_call_count INTEGER DEFAULT 0
     );
     CREATE TABLE messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
         role TEXT NOT NULL,
         content TEXT,
-        tool_call_id TEXT,
-        tool_calls TEXT,
-        tool_name TEXT,
-        timestamp REAL NOT NULL,
-        token_count INTEGER,
-        finish_reason TEXT,
-        reasoning TEXT,
-        reasoning_content TEXT,
-        reasoning_details TEXT,
-        codex_reasoning_items TEXT,
-        codex_message_items TEXT,
-        platform_message_id TEXT,
-        observed INTEGER DEFAULT 0
+        timestamp REAL NOT NULL
     );
     """
 )
@@ -313,10 +177,10 @@ connection.commit()
 ' "$db_path"
 }
 
-insert_modeb_session() {
+insert_session_row() {
   local db_path="$1"
   local session_id="$2"
-  local started_at="$3"
+  local launch_epoch="$3"
   local api_call_count="$4"
   local output_tokens="$5"
   local message_content="$6"
@@ -328,17 +192,16 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 connection.execute(
     """
-    INSERT INTO sessions (
+    INSERT OR REPLACE INTO sessions (
         id,
         source,
         started_at,
-        message_count,
-        output_tokens,
         estimated_cost_usd,
+        output_tokens,
         api_call_count
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?)
     """,
-    (sys.argv[2], "cli", float(sys.argv[3]), 1, int(sys.argv[5]), 0.0, int(sys.argv[4])),
+    (sys.argv[2], "cli", float(sys.argv[3]), 0.0, int(sys.argv[5]), int(sys.argv[4])),
 )
 connection.execute(
     """
@@ -352,10 +215,10 @@ connection.execute(
     (sys.argv[2], "user", sys.argv[6], float(sys.argv[3])),
 )
 connection.commit()
-' "$db_path" "$session_id" "$started_at" "$api_call_count" "$output_tokens" "$message_content"
+' "$db_path" "$session_id" "$launch_epoch" "$api_call_count" "$output_tokens" "$message_content"
 }
 
-update_modeb_session_metrics() {
+update_session_metrics() {
   local db_path="$1"
   local session_id="$2"
   local api_call_count="$3"
@@ -367,84 +230,495 @@ import sys
 
 connection = sqlite3.connect(sys.argv[1])
 connection.execute(
-    """
-    UPDATE sessions
-    SET api_call_count = ?, output_tokens = ?
-    WHERE id = ?
-    """,
+    "UPDATE sessions SET api_call_count = ?, output_tokens = ? WHERE id = ?",
     (int(sys.argv[3]), int(sys.argv[4]), sys.argv[2]),
 )
 connection.commit()
 ' "$db_path" "$session_id" "$api_call_count" "$output_tokens"
 }
 
-case_session_binding_revalidates_target() {
-  local harness_dir="$test_dir/session-binding"
-  local db_path="$harness_dir/state.db"
-  local preexisting_ids_path="$harness_dir/preexisting_ids"
-  local touch_log_path="$harness_dir/touch.log"
-  local stub_registry_path="$harness_dir/registry_stub.py"
-  local harness_log_path="$harness_dir/hermes.log"
-  local harness_reason_path="$harness_dir/stop.reason"
-  local harness_reason_lock_path="$harness_dir/stop.reason.lock"
+write_hermes_stub() {
+  local stub_path="$1"
+
+  cat > "$stub_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+payload=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -z)
+      shift
+      payload="${1:-}"
+      ;;
+  esac
+  shift || break
+done
+
+marker="$(python3 -c '
+import re
+import sys
+
+match = re.search(r"\[modeb-launch-id:[^\]]+\]", sys.argv[1])
+print(match.group(0) if match else "")
+' "$payload")"
+
+python3 -c '
+import sqlite3
+import sys
+import time
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    """
+    INSERT OR REPLACE INTO sessions (
+        id,
+        source,
+        started_at,
+        estimated_cost_usd,
+        output_tokens,
+        api_call_count
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    """,
+    ("stub-row", "cli", time.time(), 0.0, 10, 1),
+)
+connection.execute(
+    """
+    INSERT INTO messages (
+        session_id,
+        role,
+        content,
+        timestamp
+    ) VALUES (?, ?, ?, ?)
+    """,
+    ("stub-row", "user", sys.argv[2], time.time()),
+)
+connection.commit()
+' "$HERMES_STATE_DB" "$marker"
+
+sleep 1
+python3 -c '
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("UPDATE sessions SET api_call_count = ?, output_tokens = ? WHERE id = ?", (2, 20, "stub-row"))
+connection.commit()
+' "$HERMES_STATE_DB"
+
+printf 'MODEB_STUB_OK\n'
+EOF
+
+  chmod +x "$stub_path"
+}
+
+write_prelaunch_hook() {
+  local hook_path="$1"
+  local mode="$2"
+  local hook_job_id="${3:-hook-job}"
+
+  cat > "$hook_path" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+python3 -c 'import json, sys; json.load(sys.stdin)' >/dev/null
+if [[ "$mode" == "refuse" ]]; then
+  printf 'budget refused\n' >&2
+  exit 7
+fi
+printf '{"job_id":"%s"}\n' "$hook_job_id"
+EOF
+
+  chmod +x "$hook_path"
+}
+
+write_marker_hook() {
+  local hook_path="$1"
+  local marker_path="$2"
+  local exit_code="${3:-0}"
+
+  cat > "$hook_path" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+cat >> "$marker_path"
+exit "$exit_code"
+EOF
+
+  chmod +x "$hook_path"
+}
+
+write_release_status_hook() {
+  local hook_path="$1"
+  local status_path="$2"
+
+  cat > "$hook_path" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+python3 -c 'import json, sys; print(json.load(sys.stdin).get("status", ""))' >> "$status_path"
+EOF
+
+  chmod +x "$hook_path"
+}
+
+write_long_running_hermes_stub() {
+  local stub_path="$1"
+
+  cat > "$stub_path" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+payload=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -z)
+      shift
+      payload="${1:-}"
+      ;;
+  esac
+  shift || break
+done
+
+marker="$(python3 -c '
+import re
+import sys
+
+match = re.search(r"\[modeb-launch-id:[^\]]+\]", sys.argv[1])
+print(match.group(0) if match else "")
+' "$payload")"
+session_id="stub-$$"
+
+if [[ -n "${MODEB_STUB_PID_FILE:-}" ]]; then
+  printf '%s\n' "$$" > "$MODEB_STUB_PID_FILE"
+fi
+
+python3 -c '
+import sqlite3
+import sys
+import time
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    """
+    INSERT OR REPLACE INTO sessions (
+        id,
+        source,
+        started_at,
+        estimated_cost_usd,
+        output_tokens,
+        api_call_count
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    """,
+    (sys.argv[2], "cli", time.time(), 0.0, 10, 1),
+)
+connection.execute(
+    """
+    INSERT INTO messages (
+        session_id,
+        role,
+        content,
+        timestamp
+    ) VALUES (?, ?, ?, ?)
+    """,
+    (sys.argv[2], "user", sys.argv[3], time.time()),
+)
+connection.commit()
+' "$HERMES_STATE_DB" "$session_id" "$marker"
+
+count=1
+trap 'exit 143' TERM INT
+while true; do
+  python3 -c '
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute(
+    "UPDATE sessions SET api_call_count = ?, output_tokens = ? WHERE id = ?",
+    (int(sys.argv[3]), int(sys.argv[3]) * 10, sys.argv[2]),
+)
+connection.commit()
+' "$HERMES_STATE_DB" "$session_id" "$count"
+  count=$((count + 1))
+  sleep 1
+done
+EOF
+
+  chmod +x "$stub_path"
+}
+
+prepare_case_env() {
+  local case_name="$1"
+  local cost_brake_enabled="$2"
+  local case_dir="$test_dir/$case_name"
+
+  mkdir -p "$case_dir/bin" "$case_dir/home/.hermes" "$case_dir/hooks" "$case_dir/workdir" "$case_dir/state"
+  write_caps "$case_dir/state/hermes_caps.json" 10 5 6 30 "$cost_brake_enabled"
+  initialize_state_db "$case_dir/state.db"
+  write_hermes_stub "$case_dir/bin/hermes"
+  printf '%s\n' "$case_dir"
+}
+
+find_job_file() {
+  local case_dir="$1"
+  local job_id="$2"
+  local state_root="$case_dir/home/.claude/plugins/data/ensemble-hermes/state"
+
+  find "$state_root" -path "*/jobs/$job_id.json" -print -quit 2>/dev/null
+}
+
+read_job_field() {
+  local job_file="$1"
+  local field_path="$2"
+
+  python3 - "$job_file" "$field_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    value = json.load(handle)
+
+for part in sys.argv[2].split("."):
+    if not isinstance(value, dict):
+        value = None
+        break
+    value = value.get(part)
+
+print("" if value is None else value)
+PY
+}
+
+wait_for_job_targets() {
+  local case_dir="$1"
+  local job_id="$2"
+  local output_path="$3"
+  local job_file
+  local modeb_pid
+  local session_child_pid
+  local start_epoch
+
+  start_epoch="$(date +%s)"
+  while true; do
+    job_file="$(find_job_file "$case_dir" "$job_id")"
+    if [[ -n "$job_file" ]]; then
+      modeb_pid="$(read_job_field "$job_file" modebPid)"
+      session_child_pid="$(read_job_field "$job_file" sessionChildPid)"
+      if [[ "$modeb_pid" =~ ^[1-9][0-9]*$ && "$session_child_pid" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$job_file" > "$output_path"
+        return 0
+      fi
+    fi
+
+    if (( $(date +%s) - start_epoch >= 15 )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+wait_for_file_line() {
+  local file_path="$1"
+  local expected_line="$2"
+  local timeout_seconds="$3"
+  local start_epoch
+
+  start_epoch="$(date +%s)"
+  while true; do
+    if [[ -f "$file_path" ]] && grep -qx "$expected_line" "$file_path"; then
+      return 0
+    fi
+    if (( $(date +%s) - start_epoch >= timeout_seconds )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+run_modeb() {
+  local case_dir="$1"
+  local output_path="$2"
+  local task="$3"
+  shift 3
+
+  env \
+    HOME="$case_dir/home" \
+    HERMES_CAPS_PATH="$case_dir/state/hermes_caps.json" \
+    HERMES_STATE_DB="$case_dir/state.db" \
+    HERMES_WORKDIR="$case_dir/workdir" \
+    HERMES_MODEB_KILL_GRACE_SECONDS=1 \
+    PATH="$case_dir/bin:$PATH" \
+    "$@" \
+    bash "$MODEB_PATH" \
+      --model opencode-go/glm-5.1 \
+      --account default \
+      --session "modeb-test-$(basename "$case_dir")" \
+      --max-turns 10 \
+      --max-cost-usd 5 \
+      --idle-timeout 6 \
+      --max-wall-seconds 30 \
+      "$task" \
+      > "$output_path" 2>&1
+}
+
+task_with_report() {
+  local report_path="$1"
+  local marker="$2"
+
+  printf 'RESEARCH TASK: modeb hook %s\nREPORT DESTINATION: %s\n%s\n' "$marker" "$report_path" "$marker"
+}
+
+case_prelaunch_refuses_partial_report() {
+  local case_dir
+  local output_path
+  local report_path
+  local exit_code=0
+
+  case_dir="$(prepare_case_env prelaunch-refuse true)"
+  output_path="$case_dir/output.txt"
+  report_path="$case_dir/report.md"
+  write_prelaunch_hook "$case_dir/hooks/prelaunch" refuse
+
+  set +e
+  run_modeb "$case_dir" "$output_path" "$(task_with_report "$report_path" MODEB_REFUSE)" \
+    HERMES_HOOK_PRELAUNCH="$case_dir/hooks/prelaunch"
+  exit_code="$?"
+  set -e
+
+  [[ "$exit_code" -eq 2 ]] || return 1
+  grep -q 'preflight refused modeb launch' "$output_path" || return 1
+  grep -q 'Reason: preflight-cost-brake-refused' "$report_path"
+}
+
+case_prelaunch_allows() {
+  local case_dir
+  local output_path
+
+  case_dir="$(prepare_case_env prelaunch-allow true)"
+  output_path="$case_dir/output.txt"
+  write_prelaunch_hook "$case_dir/hooks/prelaunch" allow "hook-allow"
+
+  run_modeb "$case_dir" "$output_path" "MODEB_ALLOW" \
+    HERMES_HOOK_PRELAUNCH="$case_dir/hooks/prelaunch"
+
+  grep -q '^status=completed$' "$output_path" || return 1
+  grep -q '^job_id=hook-allow$' "$output_path"
+}
+
+case_touch_release_hooks_invoked() {
+  local case_dir
+  local output_path
+  local touch_log
+  local release_log
+
+  case_dir="$(prepare_case_env touch-release false)"
+  output_path="$case_dir/output.txt"
+  touch_log="$case_dir/touch.log"
+  release_log="$case_dir/release.log"
+  write_marker_hook "$case_dir/hooks/touch" "$touch_log" 0
+  write_marker_hook "$case_dir/hooks/release" "$release_log" 0
+
+  run_modeb "$case_dir" "$output_path" "MODEB_TOUCH_RELEASE" \
+    HERMES_HOOK_JOB_TOUCH="$case_dir/hooks/touch" \
+    HERMES_HOOK_JOB_RELEASE="$case_dir/hooks/release"
+
+  grep -q '^status=completed$' "$output_path" || return 1
+  grep -q '"status": "running"' "$touch_log" || return 1
+  grep -q '"status": "completed"' "$release_log"
+}
+
+case_no_hooks_clean_run() {
+  local case_dir
+  local output_path
+
+  case_dir="$(prepare_case_env no-hooks false)"
+  output_path="$case_dir/output.txt"
+
+  run_modeb "$case_dir" "$output_path" "MODEB_NO_HOOKS"
+
+  grep -q '^status=completed$' "$output_path"
+}
+
+case_fail_closed_without_prelaunch_hook() {
+  local case_dir
+  local output_path
+  local report_path
+  local exit_code=0
+
+  case_dir="$(prepare_case_env fail-closed true)"
+  output_path="$case_dir/output.txt"
+  report_path="$case_dir/report.md"
+
+  set +e
+  run_modeb "$case_dir" "$output_path" "$(task_with_report "$report_path" MODEB_FAIL_CLOSED)"
+  exit_code="$?"
+  set -e
+
+  [[ "$exit_code" -eq 2 ]] || return 1
+  grep -q 'prelaunch hook unavailable; refusing cost-braked launch' "$output_path" || return 1
+  grep -q 'Reason: preflight-cost-brake-refused' "$report_path"
+}
+
+case_touch_failure_best_effort() {
+  local case_dir
+  local output_path
+  local touch_log
+
+  case_dir="$(prepare_case_env touch-fails false)"
+  output_path="$case_dir/output.txt"
+  touch_log="$case_dir/touch.log"
+  write_marker_hook "$case_dir/hooks/touch" "$touch_log" 9
+
+  run_modeb "$case_dir" "$output_path" "MODEB_TOUCH_FAILS" \
+    HERMES_HOOK_JOB_TOUCH="$case_dir/hooks/touch"
+
+  grep -q '^status=completed$' "$output_path"
+}
+
+case_activity_touch_hook() {
+  local case_dir="$test_dir/activity-touch"
+  local db_path="$case_dir/state.db"
+  local preexisting_ids_path="$case_dir/preexisting_ids"
+  local reason_path="$case_dir/reason"
+  local reason_lock_path="$case_dir/reason.lock"
+  local touch_log="$case_dir/touch.log"
   local launch_epoch
-  local launch_marker="[modeb-launch-id:test-binding-marker]"
+  local launch_marker="[modeb-launch-id:activity-touch]"
   local monitor_pid
   local monitor_exit=0
   local target_pid
   local touch_count
 
-  mkdir -p "$harness_dir"
+  mkdir -p "$case_dir"
+  initialize_state_db "$db_path"
   : > "$preexisting_ids_path"
-  : > "$touch_log_path"
-  : > "$harness_log_path"
-  write_modeb_registry_stub "$stub_registry_path"
-  initialize_modeb_state_db "$db_path"
-
+  write_marker_hook "$case_dir/touch" "$touch_log" 0
   launch_epoch="$(date +%s)"
-  insert_modeb_session "$db_path" "target-row" "$launch_epoch" 1 10 "$launch_marker target"
+  insert_session_row "$db_path" "activity-row" "$launch_epoch" 1 10 "$launch_marker"
 
-  (
-    sleep 30
-  ) &
+  ( sleep 30 ) &
   target_pid="$!"
 
-  env \
-    MODEB_TEST_TOUCH_LOG="$touch_log_path" \
-    REGISTRY_PATH="$stub_registry_path" \
-    HERMES_STATE_DB="$db_path" \
-    MODEB_PATH="$MODEB_PATH" \
-    HARNESS_REASON_PATH="$harness_reason_path" \
-    HARNESS_REASON_LOCK_PATH="$harness_reason_lock_path" \
-    HARNESS_LOG_PATH="$harness_log_path" \
-    TARGET_PID="$target_pid" \
-    LAUNCH_EPOCH="$launch_epoch" \
-    PREEXISTING_IDS_PATH="$preexisting_ids_path" \
-    LAUNCH_MARKER="$launch_marker" \
-    bash -lc '
-      source "$MODEB_PATH"
-      reason_path="$HARNESS_REASON_PATH"
-      reason_lock_path="$HARNESS_REASON_LOCK_PATH"
-      log_path="$HARNESS_LOG_PATH"
-      activity_monitor_loop "$TARGET_PID" "job-binding" 6 20 99 "$LAUNCH_EPOCH" "$PREEXISTING_IDS_PATH" "$LAUNCH_MARKER"
-    ' &
+  HERMES_STATE_DB="$db_path" \
+  HERMES_HOOK_JOB_TOUCH="$case_dir/touch" \
+  bash -c '
+    source "$1"
+    reason_path="$2"
+    reason_lock_path="$3"
+    log_path="$4"
+    activity_monitor_loop "$5" "activity-job" 6 20 99 "$6" "$7" "$8" "activity-session"
+  ' bash "$MODEB_PATH" "$reason_path" "$reason_lock_path" "$case_dir/log" "$target_pid" "$launch_epoch" "$preexisting_ids_path" "$launch_marker" &
   monitor_pid="$!"
 
-  sleep 4
-  update_modeb_session_metrics "$db_path" "target-row" 2 20
-
-  sleep 1
-  insert_modeb_session "$db_path" "decoy-row" "$((launch_epoch + 1))" 1 5 "decoy session"
-  update_modeb_session_metrics "$db_path" "decoy-row" 2 15
   sleep 3
-  update_modeb_session_metrics "$db_path" "decoy-row" 3 25
+  update_session_metrics "$db_path" "activity-row" 2 20
 
   set +e
   wait "$monitor_pid"
   monitor_exit="$?"
   set -e
 
-  touch_count="$(wc -l < "$touch_log_path")"
+  touch_count="$(wc -l < "$touch_log")"
 
   if kill -0 "$target_pid" 2>/dev/null; then
     kill "$target_pid" 2>/dev/null || true
@@ -452,228 +726,134 @@ case_session_binding_revalidates_target() {
   fi
 
   [[ "$monitor_exit" -eq 0 ]] || return 1
-  [[ -f "$harness_reason_path" ]] || return 1
-  grep -q '^idle-killed$' "$harness_reason_path" || return 1
-  [[ "$touch_count" -eq 2 ]] || return 1
-  ! kill -0 "$target_pid" 2>/dev/null
+  grep -q '^idle-killed$' "$reason_path" || return 1
+  [[ "$touch_count" -ge 2 ]]
 }
 
-case_gate_acquire_before_output() {
-  local account="modeb-test-gate-$$"
-  local session_name="modeb-test-gate-$(date -u +%s)"
-  local output_path="$test_dir/gate.out"
-  local wrapper_pid
+case_misconfigured_prelaunch_hook_refuses() {
+  local case_dir
+  local output_path
+  local report_path
+  local exit_code=0
 
-  run_longrun_background "$account" "$session_name" "$output_path" \
-    "Run bash -lc 'echo MODEB_GATE_START; sleep 8; echo MODEB_GATE_DONE', then report done." \
-    --max-turns 6 --idle-timeout 60 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
-
-  wait_for_account_entry "$account" 30 || return 1
-
-  if [[ -s "$output_path" ]]; then
-    kill "$wrapper_pid" 2>/dev/null || true
-    wait "$wrapper_pid" 2>/dev/null || true
-    remove_active_wrapper_pid "$wrapper_pid"
-    return 1
-  fi
-
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20
-}
-
-case_activity_touch_advances() {
-  local account="modeb-test-touch-$$"
-  local session_name="modeb-test-touch-$(date -u +%s)"
-  local output_path="$test_dir/touch.out"
-  local wrapper_pid
-  local original_activity
-
-  run_longrun_background "$account" "$session_name" "$output_path" \
-    "Count from 1 to 10. After each number, pause briefly (1 second max) before the next. Output format: say the number, then say what comes next. Then finish and report MODEB_TOUCH_DONE." \
-    --max-turns 8 --idle-timeout 90 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
-
-  wait_for_account_entry "$account" 30 || return 1
-  original_activity="$(first_last_activity_for_account "$account")"
-  [[ -n "$original_activity" ]] || return 1
-
-  wait_for_last_activity_advance "$account" "$original_activity" 45 || return 1
-
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20
-}
-
-case_clean_release() {
-  local account="modeb-test-release-$$"
-  local session_name="modeb-test-release-$(date -u +%s)"
-  local output_path="$test_dir/release.out"
-  local wrapper_pid
-
-  run_longrun_background "$account" "$session_name" "$output_path" \
-    "Say MODEB_RELEASE_DONE and stop." \
-    --max-turns 4 --idle-timeout 60 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
-
-  wait_for_account_entry "$account" 30 || return 1
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20 || return 1
-  grep -q '^status=completed$' "$output_path"
-}
-
-case_concurrency_refused() {
-  local account="modeb-test-concurrency-$$"
-  local first_session="modeb-test-concurrency-a-$(date -u +%s)"
-  local second_session="modeb-test-concurrency-b-$(date -u +%s)"
-  local first_output="$test_dir/concurrency-first.out"
-  local second_output="$test_dir/concurrency-second.out"
-  local wrapper_pid
-  local second_exit=0
-  local model_args=()
-
-  mapfile -t model_args < <(modeb_args)
-
-  run_longrun_background "$account" "$first_session" "$first_output" \
-    "Run bash -lc 'echo MODEB_CONCURRENCY_START; sleep 20; echo MODEB_CONCURRENCY_DONE', then report done." \
-    --max-turns 8 --idle-timeout 90 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
-
-  wait_for_account_entry "$account" 30 || return 1
+  case_dir="$(prepare_case_env prelaunch-misconfigured false)"
+  output_path="$case_dir/output.txt"
+  report_path="$case_dir/report.md"
+  printf '#!/bin/bash\nexit 0\n' > "$case_dir/hooks/not-executable"
 
   set +e
-  bash "$MODEB_PATH" \
-    "${model_args[@]}" \
-    --account "$account" \
-    --session "$second_session" \
-    --max-turns 4 \
-    --idle-timeout 60 \
-    --max-cost-usd 5 \
-    "Say MODEB_SECOND_SHOULD_REFUSE." \
-    > "$second_output" 2>&1
-  second_exit="$?"
+  run_modeb "$case_dir" "$output_path" "$(task_with_report "$report_path" MODEB_BAD_PRELAUNCH)" \
+    HERMES_HOOK_PRELAUNCH="$case_dir/hooks/not-executable"
+  exit_code="$?"
   set -e
 
-  [[ "$second_exit" -eq 3 ]] || return 1
-  [[ "$(entry_count_for_account "$account")" -eq 1 ]] || return 1
-
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20
+  [[ "$exit_code" -eq 2 ]] || return 1
+  grep -q 'prelaunch hook misconfigured; refusing launch' "$output_path" || return 1
+  grep -q "$case_dir/hooks/not-executable" "$report_path"
 }
 
-case_memory_recall_full() {
-  local account="modeb-test-memory-$$"
-  local session_name="modeb-test-memory-$(date -u +%s)"
-  local fact_tag="MODEB_MEMORY_FACT_$(date -u +%s)_$$"
-  local output_path="$test_dir/memory.out"
-  local recall_output="$test_dir/memory-recall.out"
-  local wrapper_pid
+case_companion_path_expansion() {
+  local case_dir
 
-  run_longrun_background "$account" "$session_name" "$output_path" \
-    "Remember this exact tagged fact for later recall: $fact_tag means blue-ridge-17. Reply done." \
-    --max-turns 6 --idle-timeout 90 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
+  case_dir="$(prepare_case_env companion-path-expansion false)"
 
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20 || return 1
+  HOME="$case_dir/home" node --input-type=module - "$COMPANION_PATH" "$case_dir/home" <<'EOF'
+import assert from "node:assert/strict";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-  hermes -z "What value was stored for $fact_tag? Reply with only the value." --yolo > "$recall_output" 2>&1
-  grep -q 'blue-ridge-17' "$recall_output"
+const companionPath = process.argv[2];
+const homeDir = process.argv[3];
+const { resolveConfiguredPath } = await import(pathToFileURL(companionPath).href);
+
+assert.equal(resolveConfiguredPath("~/caps.json"), path.join(homeDir, "caps.json"));
+assert.equal(resolveConfiguredPath("$HOME/caps.json"), path.join(homeDir, "caps.json"));
+EOF
 }
 
-case_vault_write_full() {
-  local account="modeb-test-vault-$$"
-  local session_name="modeb-test-vault-$(date -u +%s)"
-  local note_name="modeb-test-$(date -u +%s)-$$.md"
-  local vault_path="03_Inbox/_raw/$note_name"
-  local output_path="$test_dir/vault.out"
-  local get_output="$test_dir/vault-get.out"
-  local wrapper_pid
-  local encoded_path
-  local obsidian_key_assignment
+case_companion_cancel_releases_cancelled() {
+  local case_dir
+  local start_output
+  local cancel_output
+  local job_id
+  local worker_pid
+  local job_file_path
+  local job_file
+  local modeb_pid
+  local session_child_pid
+  local stub_pid
+  local release_status_path
 
-  if [[ -f /home/brodey/vault/.env ]]; then
-    obsidian_key_assignment="$(grep '^OBSIDIAN_API_KEY=' /home/brodey/vault/.env | tail -n 1 || true)"
-    if [[ -n "$obsidian_key_assignment" ]]; then
-      export "$obsidian_key_assignment"
+  case_dir="$(prepare_case_env companion-cancel false)"
+  start_output="$case_dir/start.txt"
+  cancel_output="$case_dir/cancel.txt"
+  release_status_path="$case_dir/release-status.txt"
+  write_long_running_hermes_stub "$case_dir/bin/hermes"
+  write_release_status_hook "$case_dir/hooks/release" "$release_status_path"
+
+  env \
+    HOME="$case_dir/home" \
+    HERMES_STATE_DB="$case_dir/state.db" \
+    HERMES_WORKDIR="$case_dir/workdir" \
+    HERMES_HOOK_JOB_RELEASE="$case_dir/hooks/release" \
+    HERMES_MODEB_KILL_GRACE_SECONDS=1 \
+    MODEB_STUB_PID_FILE="$case_dir/stub.pid" \
+    PATH="$case_dir/bin:$PATH" \
+    node "$COMPANION_PATH" research \
+      --background \
+      --cwd "$case_dir/workdir" \
+      --report "$case_dir/report.md" \
+      --idle 30 \
+      --wall 60 \
+      "MODEB_COMPANION_CANCEL" \
+      > "$start_output" 2>&1
+
+  job_id="$(awk '/^started / { print $2; exit }' "$start_output")"
+  worker_pid="$(awk '/^pid / { print $2; exit }' "$start_output")"
+  [[ -n "$job_id" && "$worker_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  track_pid "$worker_pid"
+
+  job_file_path="$case_dir/job-file-path.txt"
+  wait_for_job_targets "$case_dir" "$job_id" "$job_file_path" || return 1
+  job_file="$(< "$job_file_path")"
+  modeb_pid="$(read_job_field "$job_file" modebPid)"
+  session_child_pid="$(read_job_field "$job_file" sessionChildPid)"
+  stub_pid=""
+  for _ in {1..15}; do
+    if [[ -s "$case_dir/stub.pid" ]]; then
+      stub_pid="$(< "$case_dir/stub.pid")"
+      break
     fi
-  fi
+    sleep 1
+  done
+  track_pid "$modeb_pid"
+  track_pid "$session_child_pid"
+  track_pid "$stub_pid"
 
-  if [[ -z "${OBSIDIAN_API_KEY:-}" ]] && [[ -f /home/brodey/secure/credentials/nexus.env ]]; then
-    obsidian_key_assignment="$(grep '^OBSIDIAN_API_KEY=' /home/brodey/secure/credentials/nexus.env | tail -n 1 || true)"
-    if [[ -n "$obsidian_key_assignment" ]]; then
-      export "$obsidian_key_assignment"
-    fi
-  fi
+  env \
+    HOME="$case_dir/home" \
+    HERMES_STATE_DB="$case_dir/state.db" \
+    HERMES_WORKDIR="$case_dir/workdir" \
+    HERMES_HOOK_JOB_RELEASE="$case_dir/hooks/release" \
+    HERMES_MODEB_KILL_GRACE_SECONDS=1 \
+    MODEB_STUB_PID_FILE="$case_dir/stub.pid" \
+    PATH="$case_dir/bin:$PATH" \
+    node "$COMPANION_PATH" cancel \
+      --cwd "$case_dir/workdir" \
+      "$job_id" \
+      > "$cancel_output" 2>&1
 
-  if [[ -z "${OBSIDIAN_API_KEY:-}" ]] || ! curl -sk --max-time 3 https://localhost:27124/ -o /dev/null; then
-    print_case_result "case-6-vault-write" "SKIP"
-    case_skipped=1
-    return 0
-  fi
-
-  run_longrun_background "$account" "$session_name" "$output_path" \
-    "Using the Obsidian REST API, write a note at $vault_path containing MODEB_VAULT_WRITE_OK. Do not write to vault root." \
-    --max-turns 10 --idle-timeout 120 --max-cost-usd 5
-  wrapper_pid="$started_wrapper_pid"
-
-  wait "$wrapper_pid"
-  remove_active_wrapper_pid "$wrapper_pid"
-  wait_for_no_account_entry "$account" 20 || return 1
-
-  encoded_path="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$vault_path")"
-  curl -sk \
-    -H "Authorization: Bearer $OBSIDIAN_API_KEY" \
-    "https://localhost:27124/vault/$encoded_path" \
-    > "$get_output"
-
-  grep -q 'MODEB_VAULT_WRITE_OK' "$get_output"
-}
-
-case_idle_stop_full() {
-  local account="modeb-test-idle-$$"
-  local session_name="modeb-test-idle-$(date -u +%s)"
-  local output_path="$test_dir/idle.out"
-  local idle_exit=0
-  local model_args=()
-
-  mapfile -t model_args < <(modeb_args)
-
-  set +e
-  bash "$MODEB_PATH" \
-    "${model_args[@]}" \
-    --account "$account" \
-    --session "$session_name" \
-    --max-turns 8 \
-    --idle-timeout 5 \
-    --max-cost-usd 5 \
-    "Run bash -lc 'sleep 20; echo MODEB_IDLE_DONE', then report done." \
-    > "$output_path" 2>&1
-  idle_exit="$?"
-  set -e
-
-  [[ "$idle_exit" -ne 0 ]] || return 1
-  grep -q '^status=idle-killed$' "$output_path" || return 1
-  wait_for_no_account_entry "$account" 20
+  grep -q "Cancelled research $job_id" "$cancel_output" || return 1
+  wait_for_process_group_dead "$session_child_pid" 8 || return 1
+  wait_for_pid_dead "$worker_pid" 8 || return 1
+  wait_for_pid_dead "$modeb_pid" 8 || return 1
+  [[ -z "$stub_pid" ]] || wait_for_pid_dead "$stub_pid" 8 || return 1
+  wait_for_file_line "$release_status_path" "cancelled" 8
 }
 
 case_no_leaks() {
   local after_temp_list="$test_dir/after-temp.txt"
   local new_temp_list="$test_dir/new-temp.txt"
-
-  python3 "$REGISTRY_PATH" list >/dev/null || return 1
-
-  if ! wait_for_no_account_entry "modeb-test-gate-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-touch-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-release-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-concurrency-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-memory-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-vault-$$" 1; then return 1; fi
-  if ! wait_for_no_account_entry "modeb-test-idle-$$" 1; then return 1; fi
 
   find "$TMP_ROOT" -maxdepth 1 -name 'hermes-modeb.*' -print | sort > "$after_temp_list"
   comm -13 "$before_temp_list" "$after_temp_list" > "$new_temp_list"
@@ -685,23 +865,17 @@ main() {
   before_temp_list="$test_dir/before-temp.txt"
   find "$TMP_ROOT" -maxdepth 1 -name 'hermes-modeb.*' -print | sort > "$before_temp_list"
 
-  run_case "case-1-gate-acquire-before-output" case_gate_acquire_before_output
-  run_case "case-2-last-activity-advances" case_activity_touch_advances
-  run_case "case-3-clean-release" case_clean_release
-  run_case "case-4-concurrency-refused" case_concurrency_refused
-  run_case "case-5-session-binding" case_session_binding_revalidates_target
-
-  if [[ "${HERMES_MODEB_FULL:-0}" == "1" ]]; then
-    run_case "case-6-memory-recall" case_memory_recall_full
-    run_case "case-7-vault-write" case_vault_write_full
-    run_case "case-8-idle-stop" case_idle_stop_full
-  else
-    print_case_result "case-6-memory-recall" "SKIP"
-    print_case_result "case-7-vault-write" "SKIP"
-    print_case_result "case-8-idle-stop" "SKIP"
-  fi
-
-  run_case "case-9-no-leaks" case_no_leaks
+  run_case "case-1-prelaunch-refuses-partial-report" case_prelaunch_refuses_partial_report
+  run_case "case-2-prelaunch-allows" case_prelaunch_allows
+  run_case "case-3-touch-release-hooks" case_touch_release_hooks_invoked
+  run_case "case-4-no-hooks-clean-run" case_no_hooks_clean_run
+  run_case "case-5-fail-closed-without-prelaunch-hook" case_fail_closed_without_prelaunch_hook
+  run_case "case-6-touch-failure-best-effort" case_touch_failure_best_effort
+  run_case "case-7-activity-touch-hook" case_activity_touch_hook
+  run_case "case-8-misconfigured-prelaunch-hook-refuses" case_misconfigured_prelaunch_hook_refuses
+  run_case "case-9-companion-path-expansion" case_companion_path_expansion
+  run_case "case-10-companion-cancel-releases-cancelled" case_companion_cancel_releases_cancelled
+  run_case "case-11-no-leaks" case_no_leaks
 
   if [[ "$case_failures" -gt 0 ]]; then
     return 1
